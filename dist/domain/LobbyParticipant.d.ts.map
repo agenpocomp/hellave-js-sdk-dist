@@ -1,0 +1,1 @@
+{"version":3,"file":"LobbyParticipant.d.ts","sourceRoot":"","sources":["../../src/domain/LobbyParticipant.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,kBAAkB,EAAE,MAAM,sBAAsB,CAAC;AAE/D,yEAAyE;AACzE,qBAAa,gBAAgB;IAC3B,QAAQ,CAAC,EAAE,EAAE,MAAM,CAAC;IACpB,QAAQ,CAAC,OAAO,EAAE,kBAAkB,CAAC;gBAEzB,EAAE,EAAE,MAAM,EAAE,OAAO,EAAE,kBAAkB;CAKpD"}

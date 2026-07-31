@@ -1,0 +1,1 @@
+{"version":3,"file":"RemoteMicrophoneTrack.d.ts","sourceRoot":"","sources":["../../src/media/RemoteMicrophoneTrack.ts"],"names":[],"mappings":"AAAA;;;;GAIG;AACH,qBAAa,qBAAqB;aAEd,aAAa,EAAE,MAAM;aACrB,kBAAkB,EAAE,MAAM;aAC1B,gBAAgB,EAAE,gBAAgB;gBAFlC,aAAa,EAAE,MAAM,EACrB,kBAAkB,EAAE,MAAM,EAC1B,gBAAgB,EAAE,gBAAgB;CAErD"}

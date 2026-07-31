@@ -1,0 +1,42 @@
+{
+  "name": "@hellave/js-sdk",
+  "version": "0.5.0",
+  "description": "Browser-first JavaScript SDK for the Hellave real-time communications platform",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js",
+      "default": "./dist/server/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agenpocomp/Hellave-SDKS.git",
+    "directory": "packages/js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "hellave",
+    "webrtc",
+    "sfu",
+    "video-conferencing",
+    "real-time"
+  ],
+  "license": "MIT"
+}
