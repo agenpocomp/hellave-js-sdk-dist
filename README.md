@@ -4,8 +4,8 @@
 >
 > Source of truth is `agenpocomp/Hellave-SDKS` (`packages/js`). This repo contains only
 > the contents of `npm pack` — `dist/`, `package.json`, `README.md` — so that consumers
-> can `npm install` the SDK over the network without access to the private source repo.
-> `scripts` are stripped because there is nothing to build here.
+> can `npm install` the SDK without access to the private source repo. `scripts` are
+> stripped because there is nothing to build here.
 >
 > Refresh it by re-running the SDK release for a new tag; never commit changes directly.
 

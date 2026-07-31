@@ -27,13 +27,50 @@ async function parseJson(res) {
             ...(context !== undefined && { context }),
         });
     }
-    return body;
+    // Responses are snake_case on the wire; the declared result types are camelCase. Without
+    // this, fields like `room_instance_id` never populate `roomInstanceId` and reads return
+    // undefined — which produced request URLs containing "undefined".
+    return toCamelCase(body);
 }
-function toSnakeCase(obj) {
+/**
+ * Convert object keys to snake_case for the wire format, recursing through nested
+ * objects and arrays.
+ *
+ * The backend deserializes into plain snake_case Rust structs with no serde aliases, so a
+ * shallow conversion leaves nested payloads — `policy`, `profile`, `capabilities` — in
+ * camelCase and the request is rejected with "request body is invalid".
+ */
+function toSnakeCase(value) {
+    if (Array.isArray(value)) {
+        return value.map((item) => toSnakeCase(item));
+    }
+    if (value === null || typeof value !== "object") {
+        return value;
+    }
     const result = {};
-    for (const [key, value] of Object.entries(obj)) {
+    for (const [key, nested] of Object.entries(value)) {
         const snake = key.replace(/[A-Z]/g, (l) => `_${l.toLowerCase()}`);
-        result[snake] = value;
+        result[snake] = toSnakeCase(nested);
+    }
+    return result;
+}
+/**
+ * Convert wire keys back to camelCase, recursing through nested objects and arrays.
+ *
+ * Mirror of {@link toSnakeCase} for the response direction. JWK members and error bodies
+ * contain no underscores, so this is a no-op for them.
+ */
+function toCamelCase(value) {
+    if (Array.isArray(value)) {
+        return value.map((item) => toCamelCase(item));
+    }
+    if (value === null || typeof value !== "object") {
+        return value;
+    }
+    const result = {};
+    for (const [key, nested] of Object.entries(value)) {
+        const camel = key.replace(/_([a-z0-9])/g, (_match, char) => char.toUpperCase());
+        result[camel] = toCamelCase(nested);
     }
     return result;
 }
