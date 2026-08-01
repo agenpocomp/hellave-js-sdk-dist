@@ -68,10 +68,29 @@ interface CreateMeetingParams {
     displayName: string;
     avatarUrl?: string | null;
     role?: "host" | "participant" | "viewer";
+    /** Place this participant in the lobby, awaiting admission by a moderator. */
     lobby?: boolean;
     expiresInSeconds?: number;
+    /**
+     * Room policy overrides. `lobbyEnabled` was previously forced to false, which made the
+     * backend's lobby_admission capability unreachable for anyone using createMeeting.
+     */
+    policy?: {
+        lobbyEnabled?: boolean;
+        maxParticipants?: number;
+        maxActiveVideoPublications?: number;
+        reconnectGraceSeconds?: number;
+    };
 }
 interface CreateMeetingResult {
+    /**
+     * Application-facing room id, either the one passed in or the generated fallback.
+     *
+     * Returned because attach() validates it against the room_id in the authoritative
+     * snapshot: without it a caller has to guess, and guessing the room *instance* id fails
+     * with "Public Edge returned an invalid room snapshot."
+     */
+    roomId: string;
     roomInstanceId: string;
     token: string;
     expiresAt: number;

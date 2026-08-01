@@ -1,1 +1,1 @@
-{"version":3,"file":"ControlClient.d.ts","sourceRoot":"","sources":["../../src/control/ControlClient.ts"],"names":[],"mappings":""}
+{"version":3,"file":"ControlClient.d.ts","sourceRoot":"","sources":["../../src/control/ControlClient.ts"],"names":[],"mappings":"AAyEA,iFAAiF;AACjF,MAAM,WAAW,WAAW;IAC1B,iBAAiB,EAAE,MAAM,CAAC;IAC1B,IAAI,EAAE,MAAM,CAAC;IACb,2DAA2D;IAC3D,MAAM,EAAE,MAAM,CAAC;CAChB;AAED,iDAAiD;AACjD,MAAM,WAAW,gBAAgB;IAC/B,iBAAiB,EAAE,MAAM,CAAC;IAC1B,QAAQ,EAAE,MAAM,CAAC;IACjB,2DAA2D;IAC3D,MAAM,EAAE,MAAM,CAAC;CAChB"}

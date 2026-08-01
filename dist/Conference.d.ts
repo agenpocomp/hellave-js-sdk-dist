@@ -1,5 +1,6 @@
 import type { ConnectionQuality, ClientDiagnostics } from "./ConnectionQuality.js";
 import { HellaveError } from "./contracts.js";
+import { type RoomMessage, type ReceivedReaction } from "./control/ControlClient.js";
 import type { RoomParticipant } from "./domain/RoomParticipant.js";
 import type { RoomSnapshot } from "./domain/RoomSnapshot.js";
 import { EventEmitter } from "./events/EventEmitter.js";
@@ -41,12 +42,18 @@ export interface ConferenceEvents {
     publishBlockChanged: [participant: RoomParticipant, mediaKind: "audio" | "video", blocked: boolean];
     spotlightChanged: [publicationId: string | null];
     connectionQualityChanged: [quality: ConnectionQuality];
+    roomMessage: [message: RoomMessage];
+    handRaisedChanged: [participantId: string, raised: boolean];
+    reactionReceived: [reaction: ReceivedReaction];
+    recordingChanged: [active: boolean, recordingId: string | null];
 }
 /** One stable, server-authoritative attachment to a Room Instance. */
 export declare class Conference extends EventEmitter<ConferenceEvents> {
     #private;
     readonly localParticipant: RoomParticipant;
     readonly negotiated: NegotiatedControl;
+    private raisedHands_;
+    private recording_;
     private state_;
     private snapshot_;
     private terminalError_;
@@ -54,6 +61,38 @@ export declare class Conference extends EventEmitter<ConferenceEvents> {
     private expiresAt_;
     private readonly publishBlocks;
     private constructor();
+    /**
+     * Participants whose hand is currently raised.
+     *
+     * Client-side state: raised hands travel as ephemeral events rather than snapshot fields, so
+     * a participant who joins later sees only hands raised from that point on.
+     */
+    get raisedHands(): ReadonlySet<string>;
+    /**
+     * Whether the room is being recorded, and the recording identity while it is.
+     *
+     * Client-side state, like raised hands: recording travels as an event rather than a snapshot
+     * field, so a participant who joins mid-recording learns of it only at the next change.
+     */
+    get recording(): {
+        active: boolean;
+        recordingId: string | null;
+    };
+    /**
+     * Start recording the room. Requires a host whose token carries controlRecording.
+     *
+     * Resolves with the recording identity. Retrying with the same `commandId` after an unknown
+     * outcome is safe — the Public Edge derives the recording service's idempotency key from it.
+     */
+    startRecording(commandId?: string): Promise<string | null>;
+    /** Stop the room's recording. Any host may stop what another host started. */
+    stopRecording(commandId?: string): Promise<void>;
+    /** Send a chat message to the room. Requires the token's sendMessages capability. */
+    sendMessage(body: string): void;
+    /** Raise or lower this participant's hand. Does not require sendMessages. */
+    setHandRaised(raised: boolean): void;
+    /** Send a transient reaction. Requires the token's sendMessages capability. */
+    sendReaction(reaction: string): void;
     /**
      * Capture and publish this participant's microphone.
      *

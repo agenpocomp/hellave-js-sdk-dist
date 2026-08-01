@@ -5,6 +5,11 @@ import { MediaDeviceController, } from "./media/MediaDeviceController.js";
 export class Conference extends EventEmitter {
     localParticipant;
     negotiated;
+    raisedHands_ = new Set();
+    recording_ = {
+        active: false,
+        recordingId: null,
+    };
     state_;
     snapshot_;
     terminalError_ = null;
@@ -67,7 +72,67 @@ export class Conference extends EventEmitter {
             localMuteChanged: (publication, muted) => {
                 this.emit("localMuteChanged", publication, muted);
             },
+            roomMessage: (message) => this.emit("roomMessage", message),
+            handRaisedChanged: (participantId, raised) => {
+                // Tracked here rather than in the snapshot: adding a participant field to the
+                // authoritative snapshot would break clients that parse it with an exact key set.
+                const next = new Set(this.raisedHands_);
+                if (raised)
+                    next.add(participantId);
+                else
+                    next.delete(participantId);
+                this.raisedHands_ = next;
+                this.emit("handRaisedChanged", participantId, raised);
+            },
+            reactionReceived: (reaction) => this.emit("reactionReceived", reaction),
+            recordingChanged: (active, recordingId) => {
+                this.recording_ = { active, recordingId };
+                this.emit("recordingChanged", active, recordingId);
+            },
         });
+    }
+    /**
+     * Participants whose hand is currently raised.
+     *
+     * Client-side state: raised hands travel as ephemeral events rather than snapshot fields, so
+     * a participant who joins later sees only hands raised from that point on.
+     */
+    get raisedHands() {
+        return this.raisedHands_;
+    }
+    /**
+     * Whether the room is being recorded, and the recording identity while it is.
+     *
+     * Client-side state, like raised hands: recording travels as an event rather than a snapshot
+     * field, so a participant who joins mid-recording learns of it only at the next change.
+     */
+    get recording() {
+        return this.recording_;
+    }
+    /**
+     * Start recording the room. Requires a host whose token carries controlRecording.
+     *
+     * Resolves with the recording identity. Retrying with the same `commandId` after an unknown
+     * outcome is safe — the Public Edge derives the recording service's idempotency key from it.
+     */
+    startRecording(commandId) {
+        return this.#control.setRecording(true, commandId);
+    }
+    /** Stop the room's recording. Any host may stop what another host started. */
+    stopRecording(commandId) {
+        return this.#control.setRecording(false, commandId).then(() => undefined);
+    }
+    /** Send a chat message to the room. Requires the token's sendMessages capability. */
+    sendMessage(body) {
+        this.#control.sendRoomMessage(body);
+    }
+    /** Raise or lower this participant's hand. Does not require sendMessages. */
+    setHandRaised(raised) {
+        this.#control.setHandRaised(raised);
+    }
+    /** Send a transient reaction. Requires the token's sendMessages capability. */
+    sendReaction(reaction) {
+        this.#control.sendReaction(reaction);
     }
     /** @internal Constructed only by the stable client attachment flow. */
     static create(localParticipant, snapshot, initialState, negotiated, control) {

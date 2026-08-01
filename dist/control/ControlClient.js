@@ -5,7 +5,8 @@ import { RoomSnapshot } from "../domain/RoomSnapshot.js";
 import { RemoteMicrophoneTrack } from "../media/RemoteMicrophoneTrack.js";
 import { bindPublicationOwner, markLocalMuted, markPublicationActive, markPublicationStopped, MediaPublication, } from "../media/MediaPublication.js";
 const SDK_NAME = "@hellave/js-sdk";
-const SDK_VERSION = "0.5.0";
+// Keep in step with packages/js/package.json: this is what the server sees in `hello`.
+const SDK_VERSION = "0.5.7";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -14,6 +15,20 @@ const ATTACHMENT_LIFECYCLE_CAPABILITY = "attachment_lifecycle";
 const ROOM_INSTANCE_LIFECYCLE_CAPABILITY = "room_instance_lifecycle";
 const BOUNDED_RECOVERY_CAPABILITY = "bounded_recovery";
 const PUBLISH_BLOCK_POLICY_CAPABILITY = "publish_block_policy";
+const ROOM_MESSAGING_CAPABILITY = "room_messaging";
+const PARTICIPANT_SIGNALS_CAPABILITY = "participant_signals";
+const RECORDING_CONTROL_CAPABILITY = "recording_control";
+/** Mirrors MAX_ROOM_MESSAGE_LEN on the Public Edge. */
+const MAX_ROOM_MESSAGE_LEN = 2_000;
+/** Mirrors SUPPORTED_REACTIONS on the Public Edge. */
+const SUPPORTED_REACTIONS = new Set([
+    "thumbs_up",
+    "thumbs_down",
+    "clap",
+    "heart",
+    "laugh",
+    "surprised",
+]);
 let fallbackCommandSequence = 0;
 /** Internal post-attachment transport. Media authority intentionally has no public accessor. */
 /** @internal */
@@ -58,11 +73,23 @@ export class ControlSession {
     controlRecoveryRequested = false;
     mediaRecoveryRequested = false;
     pendingRecoveryAnswer = null;
+    /**
+     * The recording command awaiting its outcome.
+     *
+     * Recording is acknowledged by a `recording_state_changed` broadcast rather than by a
+     * `command_accepted` carrying a revision, because it changes no room state and so has no
+     * revision to report. Only one may be in flight, which is what makes correlating the next
+     * state change with this command sound.
+     */
+    pendingRecording = null;
     lastIceServers = [];
     lastIceServersExpiresAt = 0;
     iceServersRefreshTimer = null;
     connectionQuality_ = "good";
     lastQualityUpdate = 0;
+    /** Previous outbound byte count, so bitrate can be a rate rather than a running total. */
+    lastBytesSent = 0;
+    lastBytesSentAt = 0;
     qualityTimer = null;
     qualityPollIntervalMs = 2_000;
     mediaOperationGeneration = 0;
@@ -837,6 +864,13 @@ export class ControlSession {
                 this.failInvalidMessage();
                 return;
             }
+            if (this.pendingRecording?.commandId === message.command_id) {
+                const recording = this.pendingRecording;
+                this.pendingRecording = null;
+                clearTimeout(recording.timeout);
+                recording.reject(error);
+                return;
+            }
             const pending = this.pending.get(message.command_id);
             if (pending) {
                 this.pending.delete(message.command_id);
@@ -928,7 +962,145 @@ export class ControlSession {
                 this.failInvalidMessage();
             return;
         }
+        if (message.type === "room_message") {
+            if (!hasExactKeys(message, ["type", "from_participant_id", "body", "sent_at"])
+                || !isBoundedId(message.from_participant_id)
+                || typeof message.body !== "string"
+                || !isRevision(message.sent_at)) {
+                this.failInvalidMessage();
+                return;
+            }
+            this.listener?.roomMessage({
+                fromParticipantId: message.from_participant_id,
+                body: message.body,
+                sentAt: message.sent_at,
+            });
+            return;
+        }
+        if (message.type === "hand_raised_changed") {
+            if (!hasExactKeys(message, ["type", "participant_id", "raised"])
+                || !isBoundedId(message.participant_id)
+                || typeof message.raised !== "boolean") {
+                this.failInvalidMessage();
+                return;
+            }
+            this.listener?.handRaisedChanged(message.participant_id, message.raised);
+            return;
+        }
+        if (message.type === "recording_state_changed") {
+            if (!hasExactKeys(message, ["type", "active", "recording_id"])
+                && !hasExactKeys(message, ["type", "active"])) {
+                this.failInvalidMessage();
+                return;
+            }
+            const recordingId = message.recording_id ?? null;
+            if (typeof message.active !== "boolean"
+                || (recordingId !== null && !isBoundedId(recordingId))) {
+                this.failInvalidMessage();
+                return;
+            }
+            // The initiator is answered with this same message, so it doubles as the command
+            // outcome; everyone else simply learns the room is being recorded.
+            if (this.pendingRecording) {
+                const pending = this.pendingRecording;
+                this.pendingRecording = null;
+                clearTimeout(pending.timeout);
+                pending.resolve(recordingId);
+            }
+            this.listener?.recordingChanged(message.active, recordingId);
+            return;
+        }
+        if (message.type === "reaction_received") {
+            if (!hasExactKeys(message, ["type", "from_participant_id", "reaction", "sent_at"])
+                || !isBoundedId(message.from_participant_id)
+                || typeof message.reaction !== "string"
+                || !isRevision(message.sent_at)) {
+                this.failInvalidMessage();
+                return;
+            }
+            this.listener?.reactionReceived({
+                fromParticipantId: message.from_participant_id,
+                reaction: message.reaction,
+                sentAt: message.sent_at,
+            });
+            return;
+        }
         this.failInvalidMessage();
+    }
+    /**
+     * Send an ephemeral room event.
+     *
+     * These carry no command_id and receive no acknowledgement: the Public Edge broadcasts them
+     * or rejects them with a control error, so there is no outcome to reconcile.
+     */
+    sendEphemeral(payload, description) {
+        if (this.terminal || this.closedByCaller || this.state_ !== "admitted") {
+            throw new HellaveError("conflict", `${description} requires an admitted attachment.`);
+        }
+        try {
+            this.socket.send(JSON.stringify(payload));
+        }
+        catch {
+            throw new HellaveError("temporarily_unavailable", `${description} could not be sent.`);
+        }
+    }
+    /**
+     * Ask the Public Edge to start or stop recording this room.
+     *
+     * Resolves with the recording identity once running, or null once stopped. Unlike the
+     * ephemeral sends, this is a command: it is refused per-command rather than fatally, so a
+     * rejection leaves the conference intact.
+     */
+    setRecording(active, callerCommandId) {
+        if (this.terminal || this.closedByCaller || this.state_ !== "admitted") {
+            return Promise.reject(new HellaveError("conflict", "Conference is not admitted."));
+        }
+        const commandId = callerCommandId ?? createCommandId();
+        if (!isBoundedId(commandId)) {
+            return Promise.reject(new HellaveError("invalid_request", "Room Command ID is invalid."));
+        }
+        if (this.pendingRecording) {
+            return Promise.reject(new HellaveError("conflict", "A recording command is already in flight.", { commandId: this.pendingRecording.commandId }));
+        }
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.pendingRecording = null;
+                // Retrying with the same command id is safe: the Public Edge derives the recording
+                // service's idempotency key from it, so a retry cannot start a second recording.
+                reject(new HellaveError("temporarily_unavailable", "Recording outcome is unknown; retry with the same command id.", { commandId, outcome: "unknown" }));
+            }, this.timeoutMs);
+            this.pendingRecording = { commandId, resolve, reject, timeout };
+            try {
+                this.socket.send(JSON.stringify({
+                    type: "recording_command",
+                    command_id: commandId,
+                    active,
+                }));
+            }
+            catch {
+                this.pendingRecording = null;
+                clearTimeout(timeout);
+                reject(new HellaveError("temporarily_unavailable", "Recording command could not be sent."));
+            }
+        });
+    }
+    sendRoomMessage(body) {
+        // Validated here because the Public Edge answers a malformed ephemeral send with a
+        // control_error, which is fatal by contract. A user typing one character too many must
+        // not end the call, so the bound is enforced before anything reaches the wire.
+        if (body.length === 0 || body.length > MAX_ROOM_MESSAGE_LEN) {
+            throw new HellaveError("invalid_request", `Chat message must be between 1 and ${MAX_ROOM_MESSAGE_LEN} characters.`);
+        }
+        this.sendEphemeral({ type: "send_room_message", body }, "Chat message");
+    }
+    setHandRaised(raised) {
+        this.sendEphemeral({ type: "set_hand_raised", raised }, "Hand raise");
+    }
+    sendReaction(reaction) {
+        if (!SUPPORTED_REACTIONS.has(reaction)) {
+            throw new HellaveError("invalid_request", `Unsupported reaction "${reaction}".`);
+        }
+        this.sendEphemeral({ type: "send_reaction", reaction }, "Reaction");
     }
     installCommittedSnapshot(next) {
         this.snapshot_ = next;
@@ -1210,6 +1382,11 @@ export class ControlSession {
         this.closeSocketOnly();
     }
     rejectPending(error) {
+        if (this.pendingRecording) {
+            clearTimeout(this.pendingRecording.timeout);
+            this.pendingRecording.reject(error);
+            this.pendingRecording = null;
+        }
         if (this.pendingRecoveryAnswer) {
             clearTimeout(this.pendingRecoveryAnswer.timeout);
             this.pendingRecoveryAnswer.reject(error);
@@ -1358,27 +1535,7 @@ export class ControlSession {
             return;
         const now = Date.now();
         try {
-            const stats = await peer.getStats();
-            let rtt = 0;
-            let jitter = 0;
-            let packetLoss = 0;
-            let bitrate = 0;
-            let candidateType = "host";
-            stats.forEach((stat) => {
-                if (stat.type === "candidate-pair" && stat.state === "succeeded") {
-                    rtt = stat.currentRoundTripTime ?? rtt;
-                    candidateType = stat.localCandidateType ?? candidateType;
-                }
-                if (stat.type === "inbound-rtp" && stat.kind === "audio") {
-                    jitter = stat.jitter ?? jitter;
-                    const lost = stat.packetsLost ?? 0;
-                    const total = stat.packetsReceived ?? 0;
-                    packetLoss = total > 0 ? lost / total : 0;
-                }
-                if (stat.type === "outbound-rtp" && stat.kind === "audio") {
-                    bitrate = stat.bitrate ?? bitrate;
-                }
-            });
+            const { rtt, jitter, packetLoss, candidateType } = await this.sampleTransport(peer);
             const quality = this.normalizeQuality(rtt, jitter, packetLoss, candidateType);
             const elapsed = now - this.lastQualityUpdate;
             if (quality !== this.connectionQuality_ && elapsed >= 2_000) {
@@ -1408,36 +1565,19 @@ export class ControlSession {
         if (!peer) {
             return {
                 rtt: 0, jitter: 0, packetLoss: 0, bitrate: 0,
+                candidateType: "unknown", protocol: "unknown",
                 quality: this.connectionQuality_, timestamp: Date.now(),
             };
         }
         try {
-            const stats = await peer.getStats();
-            let rtt = 0;
-            let jitter = 0;
-            let packetLoss = 0;
-            let bitrate = 0;
-            let candidateType = "host";
-            stats.forEach((stat) => {
-                if (stat.type === "candidate-pair" && stat.state === "succeeded") {
-                    rtt = stat.currentRoundTripTime ?? rtt;
-                    candidateType = stat.localCandidateType ?? candidateType;
-                }
-                if (stat.type === "inbound-rtp" && stat.kind === "audio") {
-                    jitter = stat.jitter ?? jitter;
-                    const lost = stat.packetsLost ?? 0;
-                    const total = stat.packetsReceived ?? 0;
-                    packetLoss = total > 0 ? lost / total : 0;
-                }
-                if (stat.type === "outbound-rtp" && stat.kind === "audio") {
-                    bitrate = stat.bitrate ?? bitrate;
-                }
-            });
+            const { rtt, jitter, packetLoss, bitrate, candidateType, protocol } = await this.sampleTransport(peer);
             return {
                 rtt: Math.round(rtt * 1000),
                 jitter: Math.round(jitter * 1000),
                 packetLoss: Math.round(packetLoss * 100),
                 bitrate: Math.round(bitrate),
+                candidateType,
+                protocol,
                 quality: this.normalizeQuality(rtt, jitter, packetLoss, candidateType),
                 timestamp: Date.now(),
             };
@@ -1445,9 +1585,61 @@ export class ControlSession {
         catch {
             return {
                 rtt: 0, jitter: 0, packetLoss: 0, bitrate: 0,
+                candidateType: "unknown", protocol: "unknown",
                 quality: this.connectionQuality_, timestamp: Date.now(),
             };
         }
+    }
+    /**
+     * Walk getStats() once and summarise the transport.
+     *
+     * `candidate-pair` carries no candidate type of its own — the spec exposes it on the
+     * `local-candidate` report that `localCandidateId` points at, so reading
+     * `stat.localCandidateType` always fell through to the default and every session looked
+     * like "host" even when relayed. `outbound-rtp` likewise has no `bitrate` member, so the
+     * rate is derived from the change in `bytesSent`.
+     */
+    async sampleTransport(peer) {
+        const stats = await peer.getStats();
+        const reports = stats;
+        const localCandidates = new Map();
+        reports.forEach((stat, id) => {
+            if (stat.type === "local-candidate")
+                localCandidates.set(id, stat);
+        });
+        let rtt = 0;
+        let jitter = 0;
+        let packetLoss = 0;
+        let bytesSent = 0;
+        let candidateType = "unknown";
+        let protocol = "unknown";
+        reports.forEach((stat) => {
+            if (stat.type === "candidate-pair" && stat.state === "succeeded") {
+                rtt = stat.currentRoundTripTime ?? rtt;
+                const local = localCandidates.get(stat.localCandidateId);
+                if (local) {
+                    candidateType = local.candidateType ?? candidateType;
+                    protocol = local.protocol ?? protocol;
+                }
+            }
+            if (stat.type === "inbound-rtp" && stat.kind === "audio") {
+                jitter = stat.jitter ?? jitter;
+                const lost = stat.packetsLost ?? 0;
+                const total = stat.packetsReceived ?? 0;
+                packetLoss = total > 0 ? lost / total : 0;
+            }
+            if (stat.type === "outbound-rtp" && stat.kind === "audio") {
+                bytesSent += stat.bytesSent ?? 0;
+            }
+        });
+        const now = Date.now();
+        const elapsedSecs = this.lastBytesSentAt === 0 ? 0 : (now - this.lastBytesSentAt) / 1000;
+        const bitrate = elapsedSecs > 0 && bytesSent >= this.lastBytesSent
+            ? ((bytesSent - this.lastBytesSent) * 8) / elapsedSecs
+            : 0;
+        this.lastBytesSent = bytesSent;
+        this.lastBytesSentAt = now;
+        return { rtt, jitter, packetLoss, bitrate, candidateType, protocol };
     }
     orderedIceServers(iceServers) {
         const stunServers = [];
@@ -1728,6 +1920,11 @@ export class ControlClient {
                         ROOM_INSTANCE_LIFECYCLE_CAPABILITY,
                         BOUNDED_RECOVERY_CAPABILITY,
                         PUBLISH_BLOCK_POLICY_CAPABILITY,
+                        // Optional: the Public Edge only sends chat and participant-signal messages to
+                        // clients that ask for them, so advertising here is what turns them on.
+                        ROOM_MESSAGING_CAPABILITY,
+                        PARTICIPANT_SIGNALS_CAPABILITY,
+                        RECORDING_CONTROL_CAPABILITY,
                     ],
                 }));
             };
@@ -2038,6 +2235,9 @@ function controlHello() {
             ROOM_INSTANCE_LIFECYCLE_CAPABILITY,
             BOUNDED_RECOVERY_CAPABILITY,
             PUBLISH_BLOCK_POLICY_CAPABILITY,
+            ROOM_MESSAGING_CAPABILITY,
+            PARTICIPANT_SIGNALS_CAPABILITY,
+            RECORDING_CONTROL_CAPABILITY,
         ],
     };
 }
@@ -2429,21 +2629,34 @@ function isProtocolVersion(value) {
         && value.major >= 1
         && value.minor >= 0;
 }
+/**
+ * Validate a room-facing profile.
+ *
+ * `avatar_url` may be absent or explicitly `null`: ParticipantProfile declares it
+ * `#[serde(default)] Option<String>` with no `skip_serializing_if`, so the backend always
+ * emits the key and sends `null` when there is no avatar. Treating `null` as invalid
+ * rejected every real participant with "Public Edge returned invalid state."
+ */
 function isProfile(value) {
-    return isRecord(value)
-        && hasExactKeys(value, value.avatar_url === undefined ? ["display_name"] : ["display_name", "avatar_url"])
+    if (!isRecord(value))
+        return false;
+    const avatarUrl = value.avatar_url;
+    return hasExactKeys(value, "avatar_url" in value ? ["display_name", "avatar_url"] : ["display_name"])
         && typeof value.display_name === "string"
         && value.display_name.length >= 1
         && value.display_name.length <= 120
-        && (value.avatar_url === undefined
-            || (typeof value.avatar_url === "string"
-                && value.avatar_url.length <= 2_048
-                && isUri(value.avatar_url)));
+        && (avatarUrl === undefined
+            || avatarUrl === null
+            || (typeof avatarUrl === "string"
+                && avatarUrl.length <= 2_048
+                && isUri(avatarUrl)));
 }
 function profileFromWire(value) {
     return {
         displayName: value.display_name,
-        ...(value.avatar_url === undefined ? {} : { avatarUrl: value.avatar_url }),
+        ...(value.avatar_url === undefined || value.avatar_url === null
+            ? {}
+            : { avatarUrl: value.avatar_url }),
     };
 }
 function isCapabilities(value) {

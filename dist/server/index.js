@@ -131,10 +131,10 @@ export class HellaveApiClient {
             roomId,
             expiresAt,
             policy: {
-                lobbyEnabled: false,
-                maxParticipants: 50,
-                maxActiveVideoPublications: 10,
-                reconnectGraceSeconds: 300,
+                lobbyEnabled: params.policy?.lobbyEnabled ?? false,
+                maxParticipants: params.policy?.maxParticipants ?? 50,
+                maxActiveVideoPublications: params.policy?.maxActiveVideoPublications ?? 10,
+                reconnectGraceSeconds: params.policy?.reconnectGraceSeconds ?? 300,
             },
         }, crypto.randomUUID());
         const token = await this.issueMeetingToken(instance.roomInstanceId, {
@@ -149,6 +149,7 @@ export class HellaveApiClient {
             lobby: params.lobby ?? false,
         });
         return {
+            roomId,
             roomInstanceId: instance.roomInstanceId,
             token: token.token,
             expiresAt: token.expiresAt,
