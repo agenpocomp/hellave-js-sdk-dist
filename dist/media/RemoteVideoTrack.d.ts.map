@@ -1,0 +1,1 @@
+{"version":3,"file":"RemoteVideoTrack.d.ts","sourceRoot":"","sources":["../../src/media/RemoteVideoTrack.ts"],"names":[],"mappings":"AAAA;;;;;;;;;GASG;AACH,qBAAa,gBAAgB;aAET,aAAa,EAAE,MAAM;aACrB,kBAAkB,EAAE,MAAM;aAC1B,gBAAgB,EAAE,gBAAgB;gBAFlC,aAAa,EAAE,MAAM,EACrB,kBAAkB,EAAE,MAAM,EAC1B,gBAAgB,EAAE,gBAAgB;CAErD"}

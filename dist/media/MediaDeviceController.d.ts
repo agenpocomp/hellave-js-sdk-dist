@@ -11,6 +11,8 @@ export interface DeviceControllerControl {
     publishCapture(source: CaptureSource, track: MediaStreamTrack, stream: MediaStream, callerCommandId?: string): Promise<string>;
     replacePublicationTrack(publicationId: string, track: MediaStreamTrack): Promise<boolean>;
     getActiveSources(): ActivePublications;
+    /** Stable publication object for a locally published source. */
+    localPublication(publicationId: string, ownerParticipantId: string, source: CaptureSource): MediaPublication;
     ownsPublication(publicationId: string): boolean;
     getLocalParticipantId(): string;
 }

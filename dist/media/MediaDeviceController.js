@@ -64,20 +64,10 @@ export class MediaDeviceController {
         }
         const stream = new MediaStream([capture.mediaStreamTrack]);
         const publicationId = await this.control.publishCapture(capture.source, capture.mediaStreamTrack, stream, options?.commandId);
-        const updated = this.control.getActiveSources();
-        const publication = updated.microphone?.id === publicationId
-            ? updated.microphone
-            : updated.camera?.id === publicationId
-                ? updated.camera
-                : updated.screen?.id === publicationId
-                    ? updated.screen
-                    : updated.screenAudio?.id === publicationId
-                        ? updated.screenAudio
-                        : undefined;
-        if (!publication) {
-            throw new HellaveError("internal", "Publication identity is unavailable after reservation.");
-        }
-        return publication;
+        // Asked for by identity rather than found by scanning the active sources: that scan
+        // depended on reconciliation having already run, so a snapshot arriving in the gap left a
+        // freshly published camera looking like it did not exist.
+        return this.control.localPublication(publicationId, this.control.getLocalParticipantId(), capture.source);
     }
     async switchDevice(publication, constraints) {
         if (!this.control.ownsPublication(publication.id)) {

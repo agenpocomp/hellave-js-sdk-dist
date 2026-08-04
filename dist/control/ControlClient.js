@@ -3,10 +3,18 @@ import { LobbyParticipant } from "../domain/LobbyParticipant.js";
 import { reconcileRoomParticipant, RoomParticipant, } from "../domain/RoomParticipant.js";
 import { RoomSnapshot } from "../domain/RoomSnapshot.js";
 import { RemoteMicrophoneTrack } from "../media/RemoteMicrophoneTrack.js";
+import { RemoteVideoTrack } from "../media/RemoteVideoTrack.js";
 import { bindPublicationOwner, markLocalMuted, markPublicationActive, markPublicationStopped, MediaPublication, } from "../media/MediaPublication.js";
+/**
+ * How long a transport waits for ICE servers before gathering without them.
+ *
+ * Long enough for a round trip to the Public Edge and its credential service, short enough that
+ * an outage delays a join rather than preventing one.
+ */
+const ICE_SERVERS_WAIT_MS = 2_000;
 const SDK_NAME = "@hellave/js-sdk";
 // Keep in step with packages/js/package.json: this is what the server sees in `hello`.
-const SDK_VERSION = "0.5.7";
+const SDK_VERSION = "0.5.15";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -18,6 +26,7 @@ const PUBLISH_BLOCK_POLICY_CAPABILITY = "publish_block_policy";
 const ROOM_MESSAGING_CAPABILITY = "room_messaging";
 const PARTICIPANT_SIGNALS_CAPABILITY = "participant_signals";
 const RECORDING_CONTROL_CAPABILITY = "recording_control";
+const SUBSCRIBER_TRANSPORT_CAPABILITY = "subscriber_transport";
 /** Mirrors MAX_ROOM_MESSAGE_LEN on the Public Edge. */
 const MAX_ROOM_MESSAGE_LEN = 2_000;
 /** Mirrors SUPPORTED_REACTIONS on the Public Edge. */
@@ -35,6 +44,7 @@ let fallbackCommandSequence = 0;
 export class ControlSession {
     socket;
     canModerateLobby;
+    serverCapabilities;
     timeoutMs;
     recoveryBudgetMs;
     recoverTransport;
@@ -48,6 +58,19 @@ export class ControlSession {
     publicationIntents_;
     peerConnection = null;
     activeMediaTransaction = null;
+    /**
+     * The transaction of an offer *we* sent and have not been answered for yet.
+     *
+     * Separate from activeMediaTransaction, which names whichever negotiation is current in either
+     * direction. Without knowing the direction there is no way to notice that a server offer has
+     * crossed one of ours: answering it overwrites activeMediaTransaction, and the answer to our own
+     * offer then fails its identity check and terminates the attachment.
+     */
+    ownOfferTransaction = null;
+    /** Woken when the offer above is answered, failed, or discarded. */
+    ownOfferWaiters = [];
+    /** Server offers dropped because one of ours was outstanding. Normal under contention. */
+    crossedServerOffers = 0;
     activePublicationCommandId = null;
     pendingMediaAnswer = null;
     snapshotResyncPending = false;
@@ -85,6 +108,8 @@ export class ControlSession {
     lastIceServers = [];
     lastIceServersExpiresAt = 0;
     iceServersRefreshTimer = null;
+    /** Resolvers for callers holding off a transport until ICE servers arrive. */
+    iceServersWaiters = [];
     connectionQuality_ = "good";
     lastQualityUpdate = 0;
     /** Previous outbound byte count, so bitrate can be a rate rather than a running total. */
@@ -96,9 +121,13 @@ export class ControlSession {
     leaving = false;
     leaveController = null;
     attachmentState;
-    constructor(socket, snapshot, localParticipant, state, mediaCapability, publicationIntents, canModerateLobby, timeoutMs, recoveryBudgetMs, recoverTransport) {
+    constructor(socket, snapshot, localParticipant, state, mediaCapability, publicationIntents, canModerateLobby, 
+    /// Capabilities the Public Edge advertised in its welcome, so the client only uses a
+    /// feature the server actually has.
+    serverCapabilities, timeoutMs, recoveryBudgetMs, recoverTransport) {
         this.socket = socket;
         this.canModerateLobby = canModerateLobby;
+        this.serverCapabilities = serverCapabilities;
         this.timeoutMs = timeoutMs;
         this.recoveryBudgetMs = recoveryBudgetMs;
         this.recoverTransport = recoverTransport;
@@ -124,6 +153,12 @@ export class ControlSession {
         this.attachedRevision = snapshot.revision;
         this.attachedState = state;
         this.#mediaCapability = mediaCapability;
+        if (state === "admitted") {
+            // Attaching to a room you already belong to — creating one, or rejoining — arrives
+            // admitted, so the later admission path never runs and the transport would never open.
+            // Deferred so the caller has the session before anything is sent on its behalf.
+            queueMicrotask(() => void this.openMediaTransport());
+        }
     }
     /** @internal Participant identities retained across recovered attachments. */
     get participantRegistry() {
@@ -351,6 +386,7 @@ export class ControlSession {
             this.pendingPublications.set(commandId, {
                 track,
                 stream,
+                source: "microphone",
                 reuseSender: false,
                 stopTrackOnFailure: true,
                 resolve,
@@ -414,7 +450,16 @@ export class ControlSession {
                 this.requestSnapshotResync();
                 reject(new HellaveError("temporarily_unavailable", "Publication outcome is unknown; reconcile before retrying this command ID.", { commandId, outcome: "unknown" }));
             }, this.timeoutMs);
-            this.pendingPublications.set(commandId, { track, stream, reuseSender: false, stopTrackOnFailure: true, resolve, reject, timeout });
+            this.pendingPublications.set(commandId, {
+                track,
+                stream,
+                source,
+                reuseSender: false,
+                stopTrackOnFailure: true,
+                resolve,
+                reject,
+                timeout,
+            });
             try {
                 this.socket.send(JSON.stringify({ type: "publication_reserve", command_id: commandId, source }));
             }
@@ -479,10 +524,10 @@ export class ControlSession {
         return publication?.ownerParticipantId === this.localParticipantId;
     }
     /** @internal Return the stable authoritative publication object for a local source. */
-    localPublication(publicationId, ownerParticipantId) {
+    localPublication(publicationId, ownerParticipantId, source = "microphone") {
         let publication = this.publications.get(publicationId);
         if (!publication) {
-            publication = new MediaPublication(publicationId, ownerParticipantId, "microphone");
+            publication = new MediaPublication(publicationId, ownerParticipantId, source);
             this.publications.set(publicationId, publication);
         }
         bindPublicationOwner(publication, this);
@@ -758,6 +803,10 @@ export class ControlSession {
                 return;
             }
             const transactionId = message.transaction_id;
+            if (this.ownOfferTransaction === transactionId) {
+                // Answered, so a server offer arriving now is no longer a crossing and is handled normally.
+                this.releaseOwnOffer();
+            }
             const application = this.peerConnection
                 .setRemoteDescription({ type: "answer", sdp: message.sdp });
             this.pendingMediaAnswer = { transactionId, application };
@@ -808,6 +857,19 @@ export class ControlSession {
                 || message.sdp.length > 1_000_000
                 || !this.peerConnection) {
                 this.failInvalidMessage();
+                return;
+            }
+            // Glare: this offer crossed one of ours on the wire, so neither side caused the other and the
+            // Public Edge could not have known. Dropped rather than answered — the SFU resolves glare in
+            // our favour by accepting our offer, which discards the very offer being delivered here, so
+            // answering it would apply a description the far end has already abandoned. It reoffers once
+            // this transaction settles.
+            //
+            // Answering it also used to be fatal in a way that had nothing to do with SDP:
+            // answerServerOffer overwrites activeMediaTransaction, and the answer to our own offer then
+            // failed its identity check and terminated the attachment.
+            if (this.ownOfferTransaction !== null) {
+                this.crossedServerOffers += 1;
                 return;
             }
             void this.answerServerOffer(message.transaction_id, message.sdp);
@@ -1110,6 +1172,10 @@ export class ControlSession {
             this.state_ = "admitted";
             this.attachmentState = "admitted";
             this.listener?.admitted(next);
+            // An admitted attachment needs a transport before the Public Edge has anywhere to send
+            // the room's media. Publishing used to be the only thing that created one, so a
+            // participant who joined to listen never received anything.
+            void this.openMediaTransport();
             return;
         }
         this.listener?.snapshotChanged(next);
@@ -1307,6 +1373,8 @@ export class ControlSession {
     }
     async renegotiateExistingPublication(type, publicationId, binding, deadline, signal) {
         const socket = this.socket;
+        // The third and last place we offer, so all three wait their turn.
+        await this.settleOwnOffer();
         const operationGeneration = ++this.mediaOperationGeneration;
         const peer = this.peerConnection ?? this.ensurePeerConnection(this.lastIceServers);
         if (type === "media_replace") {
@@ -1320,6 +1388,7 @@ export class ControlSession {
         await withinDeadline(peer.setLocalDescription(offer), deadline, signal);
         const transactionId = createCommandId();
         this.activeMediaTransaction = transactionId;
+        this.holdOwnOffer(transactionId);
         this.mediaDescriptionSent = false;
         this.bufferedIceCandidates.length = 0;
         const answer = new Promise((resolve, reject) => {
@@ -1343,6 +1412,8 @@ export class ControlSession {
     }
     replacePeerConnection() {
         this.mediaOperationGeneration += 1;
+        // Any offer we had outstanding belonged to the connection being discarded.
+        this.releaseOwnOffer();
         this.stopQualityMonitoring();
         const peer = this.peerConnection;
         if (peer)
@@ -1423,18 +1494,31 @@ export class ControlSession {
     }
     async beginPublicationNegotiation(commandId, publicationId, iceServers, pending) {
         const socket = this.socket;
+        // Before the generation is taken, so waiting cannot invalidate this operation. Publishing while
+        // the transport offer was still unanswered put two of our offers in flight at once, and the
+        // answer to the first was then read as a message for a transaction that is no longer current.
+        await this.settleOwnOffer();
         const operationGeneration = ++this.mediaOperationGeneration;
         try {
             this.lastIceServers = iceServers;
             const peer = this.ensurePeerConnection(iceServers);
-            if (!pending.reuseSender)
-                peer.addTrack(pending.track, pending.stream);
+            if (!pending.reuseSender) {
+                // addTransceiver, not addTrack: addTrack reuses a compatible recvonly transceiver and
+                // merely flips its direction, so no new media section appears in the offer and the
+                // Public Edge never sees the publication at all. One publication is one m-line, which
+                // is also what the per-publication binding assumes.
+                peer.addTransceiver(pending.track, {
+                    direction: "sendonly",
+                    streams: [pending.stream],
+                });
+            }
             const offer = await peer.createOffer(pending.reuseSender ? { iceRestart: true } : undefined);
             if (peer !== this.peerConnection || operationGeneration !== this.mediaOperationGeneration) {
                 throw new Error("media operation was replaced");
             }
             const transactionId = createCommandId();
             this.activeMediaTransaction = transactionId;
+            this.holdOwnOffer(transactionId);
             this.activePublicationCommandId = commandId;
             this.mediaDescriptionSent = false;
             this.bufferedIceCandidates.length = 0;
@@ -1448,7 +1532,7 @@ export class ControlSession {
                 transaction_id: transactionId,
                 command_id: commandId,
                 publication_id: publicationId,
-                source: "microphone",
+                source: pending.source,
                 sdp: offer.sdp,
             }));
             this.mediaDescriptionSent = true;
@@ -1462,6 +1546,38 @@ export class ControlSession {
         if (this.socket.readyState !== WebSocket.OPEN)
             return;
         this.socket.send(JSON.stringify({ type: "request_ice_servers" }));
+    }
+    /**
+     * Ask for ICE servers and wait for them, so a transport is not built without any.
+     *
+     * The request is a socket message answered by ice_servers_updated, and nothing used to wait for
+     * the answer: the first PeerConnection of a session was constructed with an empty list, so the
+     * browser had no STUN to discover its public address with and no TURN to relay through. Every
+     * candidate it produced was a host candidate, which on a page that has not been granted media
+     * access is an mDNS hostname the node cannot use. Connections then survived only when a direct
+     * UDP path happened to work, and a renegotiation could find no pairs at all.
+     *
+     * Bounded, and resolves either way: a credential service that is slow or down must degrade to
+     * host-only rather than stop anyone joining.
+     */
+    async awaitIceServers() {
+        if (this.lastIceServers.length > 0 && !this.refreshNeeded())
+            return;
+        if (this.socket.readyState !== WebSocket.OPEN)
+            return;
+        this.requestIceServers();
+        await new Promise((resolve) => {
+            const settle = () => {
+                clearTimeout(timer);
+                this.iceServersWaiters = this.iceServersWaiters.filter((each) => each !== settle);
+                resolve();
+            };
+            const timer = setTimeout(() => {
+                this.iceServersWaiters = this.iceServersWaiters.filter((each) => each !== settle);
+                resolve();
+            }, ICE_SERVERS_WAIT_MS);
+            this.iceServersWaiters.push(settle);
+        });
     }
     scheduleIceServersRefresh(ttlSecs) {
         this.clearIceServersRefresh();
@@ -1482,6 +1598,25 @@ export class ControlSession {
         this.lastIceServers = iceServers;
         this.lastIceServersExpiresAt = Date.now() + ttlSecs * 1000;
         this.scheduleIceServersRefresh(ttlSecs);
+        // Whoever is holding a transport open waiting for these.
+        const waiting = this.iceServersWaiters;
+        this.iceServersWaiters = [];
+        for (const waiter of waiting)
+            waiter();
+        // A transport built before these arrived gathered host-only. It cannot re-gather without an
+        // ICE restart, but adopting them now means the next renegotiation has them.
+        this.adoptIceServers(iceServers);
+    }
+    adoptIceServers(iceServers) {
+        const peer = this.peerConnection;
+        if (!peer || typeof peer.setConfiguration !== "function")
+            return;
+        try {
+            peer.setConfiguration({ iceServers: this.orderedIceServers(iceServers) });
+        }
+        catch {
+            // Not fatal, and not worth a listener callback: the transport keeps whatever it has.
+        }
     }
     enforceCodecBaseline(peer) {
         try {
@@ -1686,8 +1821,14 @@ export class ControlSession {
         peer.ontrack = (event) => {
             const mid = event.transceiver.mid;
             const binding = mid ? this.remotePublicationsByMid.get(mid) : undefined;
-            if (!binding || event.track.kind !== "audio")
+            // The binding is what maps a transport mid onto the domain identities; without it the
+            // track cannot be attributed to a participant, so it is dropped.
+            if (!binding)
                 return;
+            if (event.track.kind === "video") {
+                this.listener?.remoteVideoTrack(new RemoteVideoTrack(binding.publicationId, binding.ownerParticipantId, event.track));
+                return;
+            }
             this.listener?.remoteMicrophoneTrack(new RemoteMicrophoneTrack(binding.publicationId, binding.ownerParticipantId, event.track));
         };
         peer.onconnectionstatechange = () => {
@@ -1698,6 +1839,60 @@ export class ControlSession {
         this.peerConnection = peer;
         this.startQualityMonitoring();
         return peer;
+    }
+    /**
+     * Offer a receive-only transport for this attachment.
+     *
+     * Recvonly transceivers so the offer publishes nothing: the Public Edge enforces publish
+     * permissions against the SDP, and a listener may hold a token that forbids publishing
+     * entirely. Any later publication renegotiates this same connection.
+     */
+    async openMediaTransport() {
+        if (this.terminal || this.closedByCaller || this.peerConnection)
+            return;
+        if (!this.serverCapabilities.includes(SUBSCRIBER_TRANSPORT_CAPABILITY))
+            return;
+        // Before the PeerConnection exists, not after. This is the session's first transport and the
+        // one every later publication reuses, so a list that arrives late is a list never used: the
+        // reservation carries real servers, but ensurePeerConnection hands back the existing
+        // connection and they are discarded.
+        await this.awaitIceServers();
+        await this.settleOwnOffer();
+        if (this.terminal || this.closedByCaller || this.peerConnection)
+            return;
+        const operationGeneration = ++this.mediaOperationGeneration;
+        let peer = null;
+        try {
+            peer = this.ensurePeerConnection(this.lastIceServers);
+            peer.addTransceiver("audio", { direction: "recvonly" });
+            peer.addTransceiver("video", { direction: "recvonly" });
+            const offer = await peer.createOffer();
+            // Generation alone: any concurrent media operation bumps it, and this runs only when
+            // there was no peer connection to be replaced.
+            if (operationGeneration !== this.mediaOperationGeneration)
+                return;
+            await peer.setLocalDescription(offer);
+            const transactionId = createCommandId();
+            this.activeMediaTransaction = transactionId;
+            // Missed when this guard was first added, which left a server offer crossing the *transport*
+            // offer still able to take over the transaction slot.
+            this.holdOwnOffer(transactionId);
+            this.mediaDescriptionSent = false;
+            this.bufferedIceCandidates.length = 0;
+            this.socket.send(JSON.stringify({
+                type: "media_transport_offer",
+                transaction_id: transactionId,
+                sdp: offer.sdp,
+            }));
+            this.mediaDescriptionSent = true;
+            this.flushIceCandidates();
+        }
+        catch {
+            // A transport that cannot be opened is not fatal: the attachment still carries chat,
+            // hands and the room roster, and publishing later will try again.
+            peer?.close();
+            this.peerConnection = null;
+        }
     }
     async answerServerOffer(transactionId, sdp) {
         const socket = this.socket;
@@ -1762,9 +1957,13 @@ export class ControlSession {
             stream: pending.stream,
             sender,
         });
-        const publication = this.publications.get(publicationId);
-        if (publication)
-            markPublicationActive(publication);
+        let publication = this.publications.get(publicationId);
+        if (!publication) {
+            publication = new MediaPublication(publicationId, this.localParticipantId, pending.source);
+            this.publications.set(publicationId, publication);
+            bindPublicationOwner(publication, this);
+        }
+        markPublicationActive(publication);
         const recoveredIntent = this.publicationIntents_
             .findIndex((publication) => publication.id === publicationId);
         if (recoveredIntent >= 0)
@@ -1773,9 +1972,73 @@ export class ControlSession {
             this.requestSnapshotResync();
         pending.resolve(publicationId);
     }
+    /**
+     * Server offers dropped because one of ours was outstanding.
+     *
+     * Rising is normal when several people publish at once. Rising without the media settling means the
+     * two sides are trading offers instead of converging.
+     */
+    get crossedServerOfferCount() {
+        return this.crossedServerOffers;
+    }
+    /**
+     * Record that we are awaiting an answer for an offer we just sent.
+     *
+     * Every client-originated offer goes through here, so the set of callers is the set of places that
+     * send one: openMediaTransport, beginPublicationNegotiation and renegotiateExistingPublication.
+     * answerServerOffer deliberately does not — that offer is the Edge's, not ours.
+     */
+    holdOwnOffer(transactionId) {
+        this.ownOfferTransaction = transactionId;
+    }
+    /**
+     * Release the outstanding offer and wake anything waiting on it.
+     *
+     * Centralised because the field has to be released down every exit — answered, failed, peer
+     * connection replaced, media closed — and a missed one silently drops every server offer from then
+     * on. Shipping it with two of the four covered is exactly the mistake this replaces.
+     */
+    releaseOwnOffer() {
+        this.ownOfferTransaction = null;
+        for (const wake of this.ownOfferWaiters.splice(0))
+            wake();
+    }
+    /**
+     * Wait until no offer of ours is outstanding.
+     *
+     * The client cannot have two offers in flight: it keeps one transaction, so the second overwrites
+     * the first and the answer to the first is then read as a message for a transaction that is not
+     * current — which terminates the attachment. Publishing while the transport offer was still
+     * unanswered did exactly that, invisibly on loopback and roughly two runs in three against a real
+     * network.
+     *
+     * Bounded, and gives up by proceeding rather than throwing: proceeding is what happened before this
+     * existed, so a stuck transaction degrades to the old behaviour instead of hanging the publish.
+     */
+    async settleOwnOffer() {
+        if (this.ownOfferTransaction === null)
+            return;
+        await new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                const index = this.ownOfferWaiters.indexOf(wake);
+                if (index >= 0)
+                    this.ownOfferWaiters.splice(index, 1);
+                resolve();
+            }, this.timeoutMs);
+            const wake = () => {
+                clearTimeout(timeout);
+                resolve();
+            };
+            this.ownOfferWaiters.push(wake);
+        });
+    }
     failMediaTransaction(commandId) {
         const error = new HellaveError("temporarily_unavailable", "Media negotiation failed.");
         this.pendingMediaAnswer = null;
+        // Released here as well as on the answer. A transaction that fails is no longer outstanding, and
+        // leaving it set would silently drop every server offer from here on — the participant would stop
+        // hearing anyone who publishes, which is worse than the failure being reported.
+        this.releaseOwnOffer();
         if (commandId) {
             const pending = this.pendingPublications.get(commandId);
             if (pending) {
@@ -1837,6 +2100,8 @@ export class ControlSession {
         this.peerConnection?.close();
         this.peerConnection = null;
         this.activeMediaTransaction = null;
+        // The fourth release, and the second one missed first time round.
+        this.releaseOwnOffer();
         this.activePublicationCommandId = null;
         this.pendingMediaAnswer = null;
         this.mediaDescriptionSent = false;
@@ -1925,6 +2190,7 @@ export class ControlClient {
                         ROOM_MESSAGING_CAPABILITY,
                         PARTICIPANT_SIGNALS_CAPABILITY,
                         RECORDING_CONTROL_CAPABILITY,
+                        SUBSCRIBER_TRANSPORT_CAPABILITY,
                     ],
                 }));
             };
@@ -2013,7 +2279,7 @@ export class ControlClient {
                     phase = "attached";
                     settled = true;
                     cleanup();
-                    session = new ControlSession(socket, attachment.snapshot, attachment.participant, attachment.state, attachment.mediaCapability, attachment.publicationIntents, attachment.participant.capabilities.moderateLobby, this.timeoutMs, this.recoveryBudgetMs, (recoveringSession, signal, deadline) => this.recover(recoveringSession, signal, deadline));
+                    session = new ControlSession(socket, attachment.snapshot, attachment.participant, attachment.state, attachment.mediaCapability, attachment.publicationIntents, attachment.participant.capabilities.moderateLobby, negotiated.capabilities, this.timeoutMs, this.recoveryBudgetMs, (recoveringSession, signal, deadline) => this.recover(recoveringSession, signal, deadline));
                     resolve({
                         participant: attachment.participant,
                         snapshot: attachment.snapshot,
@@ -2186,11 +2452,11 @@ function parseAttached(value, roomId, roomInstanceId, participantRegistry = new 
             || !hasExactKeys(item, ["id", "owner_participant_id", "source"])
             || !isBoundedId(item.id)
             || item.owner_participant_id !== participant.id
-            || item.source !== "microphone") {
+            || !isPublicationSource(item.source)) {
             return new HellaveError("invalid_request", "Public Edge returned invalid publication intent.");
         }
         const publication = publicationRegistry.get(item.id)
-            ?? new MediaPublication(item.id, participant.id, "microphone");
+            ?? new MediaPublication(item.id, participant.id, item.source);
         publicationRegistry.set(item.id, publication);
         if (!snapshot.publications.some((active) => active.id === publication.id)) {
             markPublicationStopped(publication);
@@ -2353,7 +2619,7 @@ function parseDelta(value, current, allowLobby, participantRegistry, publication
             || !hasExactKeys(item, ["id", "owner_participant_id", "source"])
             || !isBoundedId(item.id)
             || !isBoundedId(item.owner_participant_id)
-            || item.source !== "microphone"
+            || !isPublicationSource(item.source)
             || !nextParticipants.has(item.owner_participant_id)
             || publicationChanges.has(item.id)
             || publicationRemovals.has(item.id)) {
@@ -2367,7 +2633,7 @@ function parseDelta(value, current, allowLobby, participantRegistry, publication
         publicationChanges.set(item.id, {
             id: item.id,
             ownerParticipantId: item.owner_participant_id,
-            source: "microphone",
+            source: item.source,
         });
     }
     const nextPublicationIds = new Set(current.publications.map((item) => item.id));
@@ -2472,7 +2738,7 @@ function parseSnapshot(value, roomId, roomInstanceId, allowLobby, participantReg
             || !hasExactKeys(item, ["id", "owner_participant_id", "source"])
             || !isBoundedId(item.id)
             || !isBoundedId(item.owner_participant_id)
-            || item.source !== "microphone"
+            || !isPublicationSource(item.source)
             || !seenParticipants.has(item.owner_participant_id)
             || seenPublications.has(item.id)) {
             return new HellaveError("invalid_request", "Public Edge returned invalid publications.");
@@ -2514,7 +2780,7 @@ function parseSnapshot(value, roomId, roomInstanceId, allowLobby, participantReg
     for (const item of parsedPublications) {
         let publication = publicationRegistry.get(item.id);
         if (!publication) {
-            publication = new MediaPublication(item.id, item.ownerParticipantId, "microphone");
+            publication = new MediaPublication(item.id, item.ownerParticipantId, item.source);
             publicationRegistry.set(item.id, publication);
         }
         markPublicationActive(publication);
@@ -2756,6 +3022,17 @@ function isRevision(value) {
 }
 function isNonNegativeFinite(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+/**
+ * Whether a wire value names a publication source this release understands.
+ *
+ * The parsers below all rejected anything but "microphone", so the first camera or screen
+ * publication in a room tore down every client with "invalid_request" — including clients
+ * that had published nothing themselves.
+ */
+function isPublicationSource(value) {
+    return value === "microphone" || value === "camera" || value === "screen"
+        || value === "screen_audio";
 }
 function isBoundedId(value) {
     return typeof value === "string" && value.length >= 1 && value.length <= 128;

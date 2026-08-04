@@ -7,6 +7,7 @@ import { EventEmitter } from "./events/EventEmitter.js";
 import { MediaDeviceController } from "./media/MediaDeviceController.js";
 import type { MediaPublication } from "./media/MediaPublication.js";
 import type { RemoteMicrophoneTrack } from "./media/RemoteMicrophoneTrack.js";
+import type { RemoteVideoTrack } from "./media/RemoteVideoTrack.js";
 import type { RoomCommandOptions } from "./RoomCommand.js";
 export interface SubscriptionPolicy {
     readonly audioEnabled?: boolean;
@@ -38,6 +39,7 @@ export interface ConferenceEvents {
     left: [];
     publicationAdded: [publication: MediaPublication];
     remoteMicrophoneTrack: [track: RemoteMicrophoneTrack];
+    remoteVideoTrack: [track: RemoteVideoTrack];
     localMuteChanged: [publication: MediaPublication, muted: boolean];
     publishBlockChanged: [participant: RoomParticipant, mediaKind: "audio" | "video", blocked: boolean];
     spotlightChanged: [publicationId: string | null];
@@ -100,6 +102,26 @@ export declare class Conference extends EventEmitter<ConferenceEvents> {
      * stable across transport recovery.
      */
     publishMicrophone(constraints?: boolean | MediaTrackConstraints, options?: RoomCommandOptions): Promise<MediaPublication>;
+    /**
+     * Capture and publish this participant's camera.
+     *
+     * Delegates to the media device controller, which already refuses a second camera
+     * publication and reserves the identity before WebRTC binding.
+     */
+    publishCamera(constraints?: boolean | MediaTrackConstraints, options?: RoomCommandOptions): Promise<MediaPublication>;
+    /**
+     * Capture and publish a screen share.
+     *
+     * The browser's own picker decides what is shared, so this rejects if the user dismisses it.
+     */
+    publishScreen(displayOptions?: DisplayMediaStreamOptions, options?: RoomCommandOptions): Promise<MediaPublication>;
+    /**
+     * Shared guard-and-publish path for camera and screen.
+     *
+     * Capability and state are checked before the capture prompt so a participant who cannot
+     * publish video is never asked for permission it cannot use.
+     */
+    private publishVideoCapture;
     get state(): ConferenceState;
     get snapshot(): RoomSnapshot;
     /** Inactive stable publications retained for application-driven recovery. */

@@ -56,6 +56,19 @@ export class HellaveClient {
         await this.conference_?.leave();
     }
 }
+/**
+ * Whether an origin is a loopback address.
+ *
+ * Loopback is a secure context by definition (W3C secure contexts), which is why browsers
+ * allow getUserMedia there over plain HTTP. Requiring TLS for it blocked the SDK from being
+ * pointed at a development stack at all, with no way to opt in.
+ */
+function isLoopback(url) {
+    return url.hostname === "localhost"
+        || url.hostname === "127.0.0.1"
+        || url.hostname === "[::1]"
+        || url.hostname === "::1";
+}
 function publicControlSocketUrl(input) {
     let url;
     try {
@@ -64,7 +77,8 @@ function publicControlSocketUrl(input) {
     catch {
         throw new TypeError("HellaveConfig.controlUrl must be a valid HTTPS origin");
     }
-    if (url.protocol !== "https:"
+    const secureTransport = url.protocol === "https:" || (url.protocol === "http:" && isLoopback(url));
+    if (!secureTransport
         || url.username
         || url.password
         || (url.pathname !== "/" && url.pathname !== "")
@@ -72,7 +86,8 @@ function publicControlSocketUrl(input) {
         || url.hash) {
         throw new TypeError("HellaveConfig.controlUrl must be one HTTPS origin");
     }
-    url.protocol = "wss:";
+    // Plain ws only ever follows plain http on loopback; anything reachable stays wss.
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = "/v1/control";
     return url.toString();
 }

@@ -69,6 +69,7 @@ export class Conference extends EventEmitter {
                 this.emit("roomExpiring", expiresAt);
             },
             remoteMicrophoneTrack: (track) => this.emit("remoteMicrophoneTrack", track),
+            remoteVideoTrack: (track) => this.emit("remoteVideoTrack", track),
             localMuteChanged: (publication, muted) => {
                 this.emit("localMuteChanged", publication, muted);
             },
@@ -171,6 +172,54 @@ export class Conference extends EventEmitter {
             throw error;
         }
     }
+    /**
+     * Capture and publish this participant's camera.
+     *
+     * Delegates to the media device controller, which already refuses a second camera
+     * publication and reserves the identity before WebRTC binding.
+     */
+    async publishCamera(constraints = true, options) {
+        return this.publishVideoCapture(() => this.mediaDeviceController
+            .capturePreview({ audio: false, video: constraints })
+            // capturePreview returns one CaptureTrack per track in the stream; audio was not
+            // requested, so the camera track is the only one.
+            .then((captures) => captures[0]), "Camera capture produced no video track.", options);
+    }
+    /**
+     * Capture and publish a screen share.
+     *
+     * The browser's own picker decides what is shared, so this rejects if the user dismisses it.
+     */
+    async publishScreen(displayOptions, options) {
+        return this.publishVideoCapture(() => this.mediaDeviceController.captureScreen(displayOptions), "Screen capture produced no video track.", options);
+    }
+    /**
+     * Shared guard-and-publish path for camera and screen.
+     *
+     * Capability and state are checked before the capture prompt so a participant who cannot
+     * publish video is never asked for permission it cannot use.
+     */
+    async publishVideoCapture(capture, missingTrackMessage, options) {
+        if (this.state_ !== "admitted") {
+            throw new HellaveError("conflict", "Conference is not admitted.");
+        }
+        if (!this.localParticipant.capabilities.publishVideo) {
+            throw new HellaveError("authorization_denied", "Participant cannot publish video.");
+        }
+        const captured = await capture();
+        if (!captured) {
+            throw new HellaveError("invalid_request", missingTrackMessage);
+        }
+        try {
+            return await this.mediaDeviceController.publishCapture(captured, options);
+        }
+        catch (error) {
+            // The track is live from the moment the browser granted it, so a failed publish must
+            // release the camera or the indicator light stays on with nothing being sent.
+            captured.mediaStreamTrack.stop();
+            throw error;
+        }
+    }
     get state() {
         return this.state_;
     }
@@ -207,6 +256,7 @@ export class Conference extends EventEmitter {
                 publishCapture: (source, track, stream, callerCommandId) => this.#control.publishCapture(source, track, stream, callerCommandId),
                 replacePublicationTrack: (publicationId, track) => this.#control.replacePublicationTrack(publicationId, track),
                 getActiveSources: () => this.#control.getActiveSources(),
+                localPublication: (publicationId, ownerParticipantId, source) => this.#control.localPublication(publicationId, ownerParticipantId, source),
                 ownsPublication: (id) => this.#control.ownsPublication(id),
                 getLocalParticipantId: () => this.#control.getLocalParticipantId(),
             };

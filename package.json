@@ -1,6 +1,6 @@
 {
   "name": "@hellave/js-sdk",
-  "version": "0.5.7",
+  "version": "0.5.17",
   "description": "Browser-first JavaScript SDK for the Hellave real-time communications platform",
   "type": "module",
   "sideEffects": false,
