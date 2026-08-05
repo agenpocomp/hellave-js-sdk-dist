@@ -2,6 +2,7 @@ import { CONTRACT_RELEASE, HellaveError, isHellaveErrorEnvelope, isProtocolCompa
 import { LobbyParticipant } from "../domain/LobbyParticipant.js";
 import { reconcileRoomParticipant, RoomParticipant, } from "../domain/RoomParticipant.js";
 import { RoomSnapshot } from "../domain/RoomSnapshot.js";
+import { SIMULCAST_ENCODINGS } from "../media/MediaManager.js";
 import { RemoteMicrophoneTrack } from "../media/RemoteMicrophoneTrack.js";
 import { RemoteVideoTrack } from "../media/RemoteVideoTrack.js";
 import { bindPublicationOwner, markLocalMuted, markPublicationActive, markPublicationStopped, MediaPublication, } from "../media/MediaPublication.js";
@@ -12,9 +13,38 @@ import { bindPublicationOwner, markLocalMuted, markPublicationActive, markPublic
  * an outage delays a join rather than preventing one.
  */
 const ICE_SERVERS_WAIT_MS = 2_000;
+/**
+ * Ceiling for a screen share, matching the top camera layer.
+ *
+ * A screen share is one encoding, so there is no smaller layer for the SFU to drop to: unbounded, it
+ * grows to fill the link and then starts losing packets, which takes the whole transport down with
+ * it rather than degrading. Resolution is left alone on purpose — halving shared text to save
+ * bandwidth makes it unreadable, which is worse than a lower frame rate.
+ */
+const SCREEN_SHARE_MAX_BITRATE = 1_500_000;
+/**
+ * What to pass as `sendEncodings` for a publication of this source, if anything.
+ *
+ * Returns a spreadable fragment rather than a value so the transceiver options stay unchanged for the
+ * sources that want no encodings — passing `sendEncodings: undefined` is not the same as omitting it
+ * in every browser.
+ */
+function encodingsForSource(source) {
+    if (source === "camera")
+        return { sendEncodings: [...SIMULCAST_ENCODINGS] };
+    if (source === "screen")
+        return { sendEncodings: [{ maxBitrate: SCREEN_SHARE_MAX_BITRATE }] };
+    return {};
+}
 const SDK_NAME = "@hellave/js-sdk";
 // Keep in step with packages/js/package.json: this is what the server sees in `hello`.
-const SDK_VERSION = "0.5.15";
+/**
+ * Reported to the Public Edge in `hello`, and kept in step with package.json by the release check
+ * below rather than by memory: it had drifted four versions behind, so every client in the field was
+ * identifying itself as 0.5.15 and any behaviour correlated with SDK version was being read against
+ * the wrong one.
+ */
+const SDK_VERSION = "0.5.20";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -1510,6 +1540,16 @@ export class ControlSession {
                 peer.addTransceiver(pending.track, {
                     direction: "sendonly",
                     streams: [pending.stream],
+                    // The one place encodings reach the wire, and per source:
+                    //
+                    // - A camera publishes the three simulcast layers, so the SFU has something to choose
+                    //   between. Without this it received one unlabelled encoding and could only pause a
+                    //   stream under pressure, never shrink one.
+                    // - A screen share publishes one bounded encoding. Halving the resolution of shared text
+                    //   makes it unreadable, so it gets a ceiling instead of layers — and being single-layer is
+                    //   exactly why the ceiling has to be set here.
+                    // - A microphone gets neither.
+                    ...encodingsForSource(pending.source),
                 });
             }
             const offer = await peer.createOffer(pending.reuseSender ? { iceRestart: true } : undefined);

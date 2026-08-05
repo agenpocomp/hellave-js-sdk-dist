@@ -49,6 +49,10 @@ export class MediaDeviceController {
                 track.stop();
             throw new HellaveError("invalid_request", "Screen capture produced no video track.");
         }
+        // Shared screens are read, not watched: the encoder should spend its budget on staying legible
+        // and drop frame rate instead of resolution. Without the hint it optimises for motion, which is
+        // what makes shared text turn to mush the moment the link tightens.
+        videoTrack.contentHint = "detail";
         return new CaptureTrack("screen", videoTrack, "application");
     }
     async publishCapture(capture, options) {
