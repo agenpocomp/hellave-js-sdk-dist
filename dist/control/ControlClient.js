@@ -44,7 +44,7 @@ const SDK_NAME = "@hellave/js-sdk";
  * identifying itself as 0.5.15 and any behaviour correlated with SDK version was being read against
  * the wrong one.
  */
-const SDK_VERSION = "0.5.21";
+const SDK_VERSION = "0.5.22";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -452,19 +452,26 @@ export class ControlSession {
     }
     /** @internal Replace the captured track without replacing publication identity. */
     async replaceMicrophoneTrack(track) {
-        const active = this.activePublications.entries().next().value;
-        if (!active)
-            return null;
-        const [publicationId, binding] = active;
-        const publication = this.publications.get(publicationId);
-        if (!publication) {
-            throw new HellaveError("internal", "Active microphone publication identity is unavailable.");
+        // The microphone is not necessarily the first active publication: a camera published first
+        // makes the first entry a video sender, and replacing its track with an audio track throws
+        // "Track kind does not match Sender kind". Match the active microphone by source instead.
+        let publication = null;
+        let binding = null;
+        for (const [publicationId, candidate] of this.activePublications) {
+            const candidatePublication = this.publications.get(publicationId);
+            if (candidatePublication?.source === "microphone") {
+                publication = candidatePublication;
+                binding = candidate;
+                break;
+            }
         }
+        if (!publication || !binding)
+            return null;
         if (publication.localMuted)
             track.enabled = false;
         await binding.sender.replaceTrack(track);
         binding.track.stop();
-        this.activePublications.set(publicationId, {
+        this.activePublications.set(publication.id, {
             track,
             stream: binding.stream,
             sender: binding.sender,
