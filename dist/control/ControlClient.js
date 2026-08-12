@@ -44,7 +44,7 @@ const SDK_NAME = "@hellave/js-sdk";
  * identifying itself as 0.5.15 and any behaviour correlated with SDK version was being read against
  * the wrong one.
  */
-const SDK_VERSION = "0.5.20";
+const SDK_VERSION = "0.5.21";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -101,6 +101,15 @@ export class ControlSession {
     ownOfferWaiters = [];
     /** Server offers dropped because one of ours was outstanding. Normal under contention. */
     crossedServerOffers = 0;
+    /**
+     * Server offers dropped while one of ours was outstanding, remembered so they can be answered
+     * once our own offer settles.
+     *
+     * Only the most recent is ever answered — the Edge's latest state — and the rest are dropped, so
+     * the queue is bounded. Relies on the Edge to reoffer was losing the new consumer entirely when
+     * the reoffer was lost, leaving it to_open forever.
+     */
+    pendingCrossedOffers = [];
     activePublicationCommandId = null;
     pendingMediaAnswer = null;
     snapshotResyncPending = false;
@@ -409,6 +418,10 @@ export class ControlSession {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.pendingPublications.delete(commandId);
+                // A timed-out publication never reaches publication_active, so its negotiation is over and
+                // the marker must not keep the crossed-offer deferral gate holding after it.
+                if (this.activePublicationCommandId === commandId)
+                    this.activePublicationCommandId = null;
                 this.unknownCommands.add(commandId);
                 this.requestSnapshotResync();
                 reject(new HellaveError("temporarily_unavailable", "Publication outcome is unknown; reconcile before retrying this command ID.", { commandId, outcome: "unknown" }));
@@ -476,6 +489,10 @@ export class ControlSession {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.pendingPublications.delete(commandId);
+                // A timed-out publication never reaches publication_active, so its negotiation is over and
+                // the marker must not keep the crossed-offer deferral gate holding after it.
+                if (this.activePublicationCommandId === commandId)
+                    this.activePublicationCommandId = null;
                 this.unknownCommands.add(commandId);
                 this.requestSnapshotResync();
                 reject(new HellaveError("temporarily_unavailable", "Publication outcome is unknown; reconcile before retrying this command ID.", { commandId, outcome: "unknown" }));
@@ -833,13 +850,16 @@ export class ControlSession {
                 return;
             }
             const transactionId = message.transaction_id;
+            const application = this.peerConnection
+                .setRemoteDescription({ type: "answer", sdp: message.sdp });
+            // Applied before releaseOwnOffer so the crossed-offer retry can see it: a publication's
+            // publication_active arrives next, and answering a crossed offer before it would overwrite
+            // the transaction slot and fail the publication's identity check.
+            this.pendingMediaAnswer = { transactionId, application };
             if (this.ownOfferTransaction === transactionId) {
                 // Answered, so a server offer arriving now is no longer a crossing and is handled normally.
                 this.releaseOwnOffer();
             }
-            const application = this.peerConnection
-                .setRemoteDescription({ type: "answer", sdp: message.sdp });
-            this.pendingMediaAnswer = { transactionId, application };
             void application
                 .then(() => {
                 const recovery = this.pendingRecoveryAnswer;
@@ -890,16 +910,18 @@ export class ControlSession {
                 return;
             }
             // Glare: this offer crossed one of ours on the wire, so neither side caused the other and the
-            // Public Edge could not have known. Dropped rather than answered — the SFU resolves glare in
-            // our favour by accepting our offer, which discards the very offer being delivered here, so
-            // answering it would apply a description the far end has already abandoned. It reoffers once
-            // this transaction settles.
-            //
-            // Answering it also used to be fatal in a way that had nothing to do with SDP:
-            // answerServerOffer overwrites activeMediaTransaction, and the answer to our own offer then
-            // failed its identity check and terminated the attachment.
+            // Public Edge could not have known. It is remembered rather than answered — answering it while
+            // our own offer is outstanding would overwrite activeMediaTransaction, and the answer to our
+            // own offer would then fail its identity check and terminate the attachment. Once our own offer
+            // settles (releaseOwnOffer) the latest crossed offer is answered, so a new consumer is not left
+            // to_open forever by a reoffer that never arrives.
             if (this.ownOfferTransaction !== null) {
                 this.crossedServerOffers += 1;
+                // Only the newest crossed offer is ever answered (retryCrossedOffer drains to the last
+                // entry), so capping here to just the newest bounds full-SDP memory while a genuinely
+                // stuck own offer keeps a queue open that nothing else would flush.
+                this.pendingCrossedOffers.length = 0;
+                this.pendingCrossedOffers.push({ transactionId: message.transaction_id, sdp: message.sdp });
                 return;
             }
             void this.answerServerOffer(message.transaction_id, message.sdp);
@@ -974,6 +996,11 @@ export class ControlSession {
             const publication = this.pendingPublications.get(message.command_id);
             if (publication) {
                 this.pendingPublications.delete(message.command_id);
+                // A rejected publication never activates, so its negotiation is over and the marker must not
+                // keep the crossed-offer deferral gate holding after it.
+                if (this.activePublicationCommandId === message.command_id) {
+                    this.activePublicationCommandId = null;
+                }
                 clearTimeout(publication.timeout);
                 this.unknownCommands.delete(message.command_id);
                 if (publication.stopTrackOnFailure)
@@ -1980,6 +2007,11 @@ export class ControlSession {
         }
         if (this.pendingMediaAnswer === answer)
             this.pendingMediaAnswer = null;
+        // The publication's answer was applied and its publication_active arrived, so the negotiation
+        // is settled. The marker scopes the crossed-offer deferral gate, and leaving it set past the
+        // first publication would defer every later media_restart/media_replace crossing (which has no
+        // publication_active of its own) forever.
+        this.activePublicationCommandId = null;
         const pending = this.pendingPublications.get(commandId);
         if (!pending)
             return;
@@ -2011,6 +2043,9 @@ export class ControlSession {
         if (revision !== this.snapshot_.revision)
             this.requestSnapshotResync();
         pending.resolve(publicationId);
+        // The publication negotiation has fully settled, so a crossed server offer deferred while its
+        // publication_active was outstanding can now be answered safely.
+        this.retryCrossedOffer();
     }
     /**
      * Server offers dropped because one of ours was outstanding.
@@ -2042,6 +2077,34 @@ export class ControlSession {
         this.ownOfferTransaction = null;
         for (const wake of this.ownOfferWaiters.splice(0))
             wake();
+        this.retryCrossedOffer();
+    }
+    /**
+     * Answer the most recent server offer that crossed an offer of ours, once our own offer has
+     * settled.
+     *
+     * Only the latest crossed offer is answered — the Edge's newest state — and the rest of the queue
+     * is dropped, which bounds it.
+     *
+     * Deferred while a publication's answer is being applied but its publication_active has not
+     * arrived: answering would overwrite activeMediaTransaction, and the publication_active would then
+     * fail its transaction identity check in activatePublication and roll back an accepted
+     * publication. activatePublication retries once it has settled.
+     *
+     * activePublicationCommandId is set only while a publication negotiation is genuinely in flight and
+     * cleared when it settles (activatePublication) or dies (failMediaTransaction, publication timeout,
+     * command_rejected, closeMedia) — otherwise a stale marker would defer every later
+     * media_restart/media_replace crossing, which has no publication_active to clear it.
+     */
+    retryCrossedOffer() {
+        const pending = this.pendingCrossedOffers[this.pendingCrossedOffers.length - 1];
+        if (!pending)
+            return;
+        if (this.activePublicationCommandId !== null && this.pendingMediaAnswer !== null) {
+            return;
+        }
+        this.pendingCrossedOffers.length = 0;
+        void this.answerServerOffer(pending.transactionId, pending.sdp);
     }
     /**
      * Wait until no offer of ours is outstanding.
@@ -2063,6 +2126,9 @@ export class ControlSession {
                 const index = this.ownOfferWaiters.indexOf(wake);
                 if (index >= 0)
                     this.ownOfferWaiters.splice(index, 1);
+                // A genuinely stuck own offer (never answered, never failed) must not hold the glare gate
+                // forever, so timing out releases it — and any crossed offer it was hiding is then retried.
+                this.releaseOwnOffer();
                 resolve();
             }, this.timeoutMs);
             const wake = () => {
@@ -2075,6 +2141,9 @@ export class ControlSession {
     failMediaTransaction(commandId) {
         const error = new HellaveError("temporarily_unavailable", "Media negotiation failed.");
         this.pendingMediaAnswer = null;
+        // The negotiation that owned the marker is over, so it must not keep the crossed-offer deferral
+        // gate holding after the failure (a failed media_restart has no publication_active to clear it).
+        this.activePublicationCommandId = null;
         // Released here as well as on the answer. A transaction that fails is no longer outstanding, and
         // leaving it set would silently drop every server offer from here on — the participant would stop
         // hearing anyone who publishes, which is worse than the failure being reported.
@@ -2140,10 +2209,13 @@ export class ControlSession {
         this.peerConnection?.close();
         this.peerConnection = null;
         this.activeMediaTransaction = null;
-        // The fourth release, and the second one missed first time round.
-        this.releaseOwnOffer();
+        // Cleared before releaseOwnOffer, which drains the queue: there is no peer left to answer any
+        // crossed offers against, and a replacement session must not inherit them.
+        this.pendingCrossedOffers.length = 0;
         this.activePublicationCommandId = null;
         this.pendingMediaAnswer = null;
+        // The fourth release, and the second one missed first time round.
+        this.releaseOwnOffer();
         this.mediaDescriptionSent = false;
         this.bufferedIceCandidates.length = 0;
         this.remotePublicationsByMid.clear();
