@@ -44,7 +44,7 @@ const SDK_NAME = "@hellave/js-sdk";
  * identifying itself as 0.5.15 and any behaviour correlated with SDK version was being read against
  * the wrong one.
  */
-const SDK_VERSION = "0.5.22";
+const SDK_VERSION = "0.5.23";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";
@@ -1427,7 +1427,16 @@ export class ControlSession {
                 return;
             }
             catch (error) {
-                if (error instanceof HellaveError && !error.retryable)
+                // The server no longer recognises the publication: the SFU reaped the participant (e.g.
+                // an ICE timeout) and the attachment's media binding was forgotten. A restart of that
+                // publication can never be answered, so this is not terminal — the recovery below
+                // re-adopts the publication identity and replaces the Media Session, keeping the
+                // participant in the room. Surfaced by the Public Edge as "media restart does not match
+                // an active publication" (invalid_request, contractually non-retryable), which is why the
+                // match is on the message rather than the retryability flag.
+                const publicationForgotten = error instanceof HellaveError
+                    && error.message.includes("media restart does not match an active publication");
+                if (error instanceof HellaveError && !publicationForgotten && !error.retryable)
                     throw error;
             }
         }
