@@ -44,7 +44,7 @@ const SDK_NAME = "@hellave/js-sdk";
  * identifying itself as 0.5.15 and any behaviour correlated with SDK version was being read against
  * the wrong one.
  */
-const SDK_VERSION = "0.5.23";
+const SDK_VERSION = "0.5.24";
 const WAITING_CAPABILITY = "waiting_conference";
 const LOBBY_CAPABILITY = "lobby_admission";
 const MICROPHONE_CAPABILITY = "microphone_publication";

@@ -133,7 +133,7 @@ export class HellaveApiClient {
             policy: {
                 lobbyEnabled: params.policy?.lobbyEnabled ?? false,
                 maxParticipants: params.policy?.maxParticipants ?? 50,
-                maxActiveVideoPublications: params.policy?.maxActiveVideoPublications ?? 10,
+                maxActiveVideoPublications: params.policy?.maxActiveVideoPublications ?? 50,
                 reconnectGraceSeconds: params.policy?.reconnectGraceSeconds ?? 300,
             },
         }, crypto.randomUUID());
